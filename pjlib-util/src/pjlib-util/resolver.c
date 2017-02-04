@@ -835,7 +835,7 @@ PJ_DEF(pj_status_t) pj_dns_resolver_start_query( pj_dns_resolver *resolver,
     pj_time_val now;
     struct res_key key;
     struct cached_res *cache;
-    pj_dns_async_query *q;
+    pj_dns_async_query *q, *p_q = NULL;
     pj_uint32_t hval;
     pj_status_t status = PJ_SUCCESS;
 
@@ -848,9 +848,6 @@ PJ_DEF(pj_status_t) pj_dns_resolver_start_query( pj_dns_resolver *resolver,
 
     /* Check type */
     PJ_ASSERT_RETURN(type > 0 && type < 0xFFFF, PJ_EINVAL);
-
-    if (p_query)
-	*p_query = NULL;
 
     /* Build resource key for looking up hash tables */
     init_res_key(&key, type, name);
@@ -911,7 +908,13 @@ PJ_DEF(pj_status_t) pj_dns_resolver_start_query( pj_dns_resolver *resolver,
 	    /* Must return PJ_SUCCESS */
 	    status = PJ_SUCCESS;
 
-	    goto on_return;
+	    /*
+	     * We cannot write to *p_query after calling cb because what
+	     * p_query points to may have been freed by cb.
+             * Refer to ticket #1974.
+	     */
+	    pj_mutex_unlock(resolver->mutex);
+	    return status;
 	}
 
 	/* At this point, we have a cached entry, but this entry has expired.
@@ -943,6 +946,7 @@ PJ_DEF(pj_status_t) pj_dns_resolver_start_query( pj_dns_resolver *resolver,
 	/* Done. This child query will be notified once the "parent"
 	 * query completes.
 	 */
+	p_q = nq;
 	status = PJ_SUCCESS;
 	goto on_return;
     } 
@@ -970,10 +974,12 @@ PJ_DEF(pj_status_t) pj_dns_resolver_start_query( pj_dns_resolver *resolver,
     pj_hash_set_np(resolver->hquerybyres, &q->key, sizeof(q->key),
 		   0, q->hbufkey, q);
 
-    if (p_query)
-	*p_query = q;
+    p_q = q;
 
 on_return:
+    if (p_query)
+	*p_query = p_q;
+
     pj_mutex_unlock(resolver->mutex);
     return status;
 }
@@ -1363,8 +1369,7 @@ static void report_nameserver_status(pj_dns_resolver *resolver,
 	q_id = (pj_uint32_t)-1;
     }
 
-    if (!pkt || rcode == PJ_DNS_RCODE_SERVFAIL ||
-	        rcode == PJ_DNS_RCODE_REFUSED ||
+    if (!pkt || rcode == PJ_DNS_RCODE_REFUSED ||
 	        rcode == PJ_DNS_RCODE_NOTAUTH) 
     {
 	is_good = PJ_FALSE;
@@ -1445,10 +1450,12 @@ static void update_res_cache(pj_dns_resolver *resolver,
     if (ttl > resolver->settings.cache_max_ttl)
 	ttl = resolver->settings.cache_max_ttl;
 
+    /* Get a cache response entry */
+    cache = (struct cached_res *) pj_hash_get(resolver->hrescache, key,
+    					      sizeof(*key), &hval);
+
     /* If TTL is zero, clear the same entry in the hash table */
     if (ttl == 0) {
-	cache = (struct cached_res *) pj_hash_get(resolver->hrescache, key, 
-						  sizeof(*key), &hval);
 	/* Remove the entry before releasing its pool (see ticket #1710) */
 	pj_hash_set(NULL, resolver->hrescache, key, sizeof(*key), hval, NULL);
 
@@ -1458,24 +1465,23 @@ static void update_res_cache(pj_dns_resolver *resolver,
 	return;
     }
 
-    /* Get a cache response entry */
-    cache = (struct cached_res *) pj_hash_get(resolver->hrescache, key, 
-    					      sizeof(*key), &hval);
     if (cache == NULL) {
-	cache = alloc_entry(resolver);
-    } else if (cache->ref_cnt > 1) {
-	/* When cache entry is being used by callback (to app), just decrement
-	 * ref_cnt so it will be freed after the callback returns and allocate
-	 * new entry.
-	 */
-	cache->ref_cnt--;
 	cache = alloc_entry(resolver);
     } else {
 	/* Remove the entry before resetting its pool (see ticket #1710) */
 	pj_hash_set(NULL, resolver->hrescache, key, sizeof(*key), hval, NULL);
 
-	/* Reset cache to avoid bloated cache pool */
-	reset_entry(&cache);
+	if (cache->ref_cnt > 1) {
+	    /* When cache entry is being used by callback (to app),
+	     * just decrement ref_cnt so it will be freed after
+	     * the callback returns and allocate new entry.
+	     */
+	    cache->ref_cnt--;
+	    cache = alloc_entry(resolver);
+	} else {
+	    /* Reset cache to avoid bloated cache pool */
+	    reset_entry(&cache);
+	}
     }
 
     /* Duplicate the packet.
@@ -1921,4 +1927,3 @@ PJ_DEF(void) pj_dns_resolver_dump(pj_dns_resolver *resolver,
     pj_mutex_unlock(resolver->mutex);
 #endif
 }
-
